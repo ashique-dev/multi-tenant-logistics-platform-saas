@@ -1,0 +1,37 @@
+# docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# Prod-like: no UIs or datastores published, resource limits, required secrets enforced.
+# Real production uses an orchestrator + secrets manager; this file demonstrates the
+# posture (limits, no exposed internals, fail-fast on missing secrets).
+
+services:
+  nginx:
+    ports: ['80:8080']        # TLS terminates at the real load balancer / ingress
+    deploy: { resources: { limits: { cpus: '0.5', memory: 128M } } }
+
+  api:
+    environment:
+      NODE_ENV: production
+      SWAGGER_ENABLED: 'false'
+      CORS_ORIGINS: ${CORS_ORIGINS:?set explicit allow-list}
+    deploy: { resources: { limits: { cpus: '1.0', memory: 512M } } }
+
+  worker:
+    environment: { NODE_ENV: production }
+    deploy: { resources: { limits: { cpus: '1.0', memory: 512M } } }
+
+  relay:
+    environment: { NODE_ENV: production }
+    deploy: { resources: { limits: { cpus: '0.5', memory: 256M } } }
+
+  postgres:
+    deploy: { resources: { limits: { cpus: '2.0', memory: 2G } } }
+  redis-cache:
+    deploy: { resources: { limits: { cpus: '0.5', memory: 384M } } }
+  redis-queue:
+    deploy: { resources: { limits: { cpus: '0.5', memory: 384M } } }
+  kafka:
+    deploy: { resources: { limits: { cpus: '1.5', memory: 1536M } } }
+  rabbitmq:
+    deploy: { resources: { limits: { cpus: '1.0', memory: 768M } } }
+  objectstore:
+    deploy: { resources: { limits: { cpus: '0.5', memory: 512M } } }

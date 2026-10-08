@@ -1,0 +1,336 @@
+# Base topology. Layer with docker-compose.dev.yml or docker-compose.prod.yml.
+#
+# Profiles (so a laptop/WSL2 box is not forced to run everything):
+#   (none)         core: nginx, api, worker, relay, postgres, redis-cache, redis-queue, minio
+#   messaging      kafka, kafka-ui, rabbitmq            (needed from Phase 3)
+#   observability  prometheus, grafana, otel, jaeger, exporters
+#   dev            mailpit
+#
+# NOTE: `depends_on: service_healthy` orders startup; it is NOT a readiness guarantee
+# for later outages. The app also retries its own connections (Phase 3).
+
+x-app: &app
+  build: { context: ., target: runtime }
+  image: logistics-platform:local
+  init: true
+  restart: unless-stopped
+  env_file: [.env]
+  networks: [app, data]
+  stop_grace_period: 20s
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: ['no-new-privileges:true']
+  cap_drop: [ALL]
+  healthcheck:
+    test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:'+process.env.HEALTH_PORT+'/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 30s
+
+services:
+  # ---------------------------------------------------------------- edge
+  nginx:
+    image: ${NGINX_IMAGE:-nginx:1.27-alpine}
+    restart: unless-stopped
+    networks: [edge]
+    depends_on:
+      api: { condition: service_healthy }
+    volumes: ['./ops/nginx/nginx.conf:/etc/nginx/nginx.conf:ro']
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:8080/health/live || exit 1']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------- application
+  api:
+    <<: *app
+    networks: [edge, app, data, messaging, observability]
+    environment:
+      HEALTH_PORT: '3000'
+      PORT: '3000'
+    command: ['node', 'dist/entrypoints/api.js']
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis-cache: { condition: service_healthy }
+      redis-queue: { condition: service_healthy }
+
+  worker:
+    <<: *app
+    networks: [app, data, messaging, observability]
+    environment: { HEALTH_PORT: '9100', OPS_PORT: '9100' }
+    command: ['node', 'dist/entrypoints/worker.js']
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis-cache: { condition: service_healthy }
+      redis-queue: { condition: service_healthy }
+
+  relay:
+    <<: *app
+    networks: [app, data, messaging, observability]
+    environment: { HEALTH_PORT: '9100', OPS_PORT: '9100' }
+    command: ['node', 'dist/entrypoints/relay.js']
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # ---------------------------------------------------------------- data
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    restart: unless-stopped
+    networks: [data, observability]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      APP_MIGRATOR_PASSWORD: ${APP_MIGRATOR_PASSWORD:?set in .env}
+      APP_RUNTIME_PASSWORD: ${APP_RUNTIME_PASSWORD:?set in .env}
+      APP_READONLY_PASSWORD: ${APP_READONLY_PASSWORD:?set in .env}
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - max_connections=100
+      - -c
+      - log_min_duration_statement=200
+      - -c
+      - idle_in_transaction_session_timeout=30000
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./ops/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Two instances on purpose: a cache must EVICT, a job queue must NEVER evict.
+  redis-cache:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    restart: unless-stopped
+    networks: [data, observability]
+    environment: { REDISCLI_AUTH: '${REDIS_CACHE_PASSWORD:?set in .env}' }
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_CACHE_PASSWORD}
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ''
+      - --appendonly
+      - 'no'
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-queue:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    restart: unless-stopped
+    networks: [data, observability]
+    environment: { REDISCLI_AUTH: '${REDIS_QUEUE_PASSWORD:?set in .env}' }
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_QUEUE_PASSWORD}
+      - --maxmemory-policy
+      - noeviction
+      - --appendonly
+      - 'yes'
+      - --appendfsync
+      - everysec
+    volumes: [redis-queue-data:/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  objectstore:
+    image: ${OBJECTSTORE_IMAGE:-rustfs/rustfs:latest}
+    restart: unless-stopped
+    networks: [data]
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:?set in .env}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:?set in .env}
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+    volumes: [objectstore-data:/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'curl --fail http://127.0.0.1:9000/health || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ---------------------------------------------------------------- messaging
+  kafka:
+    profiles: [messaging]
+    image: ${KAFKA_IMAGE:-apache/kafka:3.9.0}
+    restart: unless-stopped
+    networks: [messaging, observability]
+    environment:
+      KAFKA_NODE_ID: '1'
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1'
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: '0'
+      KAFKA_NUM_PARTITIONS: '6'
+      # Topics are created explicitly (Phase 3 init job), never implicitly by a typo.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+    volumes: [kafka-data:/var/lib/kafka/data]
+    healthcheck:
+      test: ['CMD-SHELL', '/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1']
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  kafka-ui:
+    profiles: [messaging]
+    image: ${KAFKA_UI_IMAGE:-kafbat/kafka-ui:latest}
+    restart: unless-stopped
+    networks: [messaging]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: 'false'
+    depends_on:
+      kafka: { condition: service_healthy }
+
+  rabbitmq:
+    profiles: [messaging]
+    image: ${RABBITMQ_IMAGE:-rabbitmq:4-management}
+    restart: unless-stopped
+    networks: [messaging, observability]
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set in .env}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - ./ops/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  mailpit:
+    profiles: [dev]
+    image: ${MAILPIT_IMAGE:-axllent/mailpit:latest}
+    restart: unless-stopped
+    networks: [app]
+    healthcheck:
+      test: ['CMD', '/mailpit', 'readyz']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------- observability
+  otel-collector:
+    profiles: [observability]
+    image: ${OTEL_COLLECTOR_IMAGE:-otel/opentelemetry-collector-contrib:latest}
+    restart: unless-stopped
+    networks: [app, observability]
+    command: ['--config=/etc/otel/config.yaml']
+    volumes: ['./ops/otel/otel-collector.yaml:/etc/otel/config.yaml:ro']
+    depends_on: [jaeger]
+
+  jaeger:
+    profiles: [observability]
+    image: ${JAEGER_IMAGE:-jaegertracing/all-in-one:latest}
+    restart: unless-stopped
+    networks: [observability]
+    environment: { COLLECTOR_OTLP_ENABLED: 'true' }
+
+  prometheus:
+    profiles: [observability]
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:latest}
+    restart: unless-stopped
+    networks: [observability]
+    command: ['--config.file=/etc/prometheus/prometheus.yml', '--storage.tsdb.retention.time=7d']
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    profiles: [observability]
+    image: ${GRAFANA_IMAGE:-grafana/grafana:latest}
+    restart: unless-stopped
+    networks: [observability]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?set in .env}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus]
+
+  postgres-exporter:
+    profiles: [observability]
+    image: ${POSTGRES_EXPORTER_IMAGE:-quay.io/prometheuscommunity/postgres-exporter:latest}
+    restart: unless-stopped
+    networks: [data, observability]
+    environment:
+      DATA_SOURCE_NAME: postgresql://app_readonly:${APP_READONLY_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  redis-exporter-cache:
+    profiles: [observability]
+    image: ${REDIS_EXPORTER_IMAGE:-oliver006/redis_exporter:latest}
+    restart: unless-stopped
+    networks: [data, observability]
+    environment: { REDIS_ADDR: 'redis://redis-cache:6379', REDIS_PASSWORD: '${REDIS_CACHE_PASSWORD}' }
+    depends_on:
+      redis-cache: { condition: service_healthy }
+
+  redis-exporter-queue:
+    profiles: [observability]
+    image: ${REDIS_EXPORTER_IMAGE:-oliver006/redis_exporter:latest}
+    restart: unless-stopped
+    networks: [data, observability]
+    environment: { REDIS_ADDR: 'redis://redis-queue:6379', REDIS_PASSWORD: '${REDIS_QUEUE_PASSWORD}' }
+    depends_on:
+      redis-queue: { condition: service_healthy }
+
+  kafka-exporter:
+    profiles: [observability, messaging]
+    image: ${KAFKA_EXPORTER_IMAGE:-danielqsj/kafka-exporter:latest}
+    restart: unless-stopped
+    networks: [messaging, observability]
+    command: ['--kafka.server=kafka:9092']
+    depends_on:
+      kafka: { condition: service_healthy }
+
+networks:
+  edge: {}
+  app: {}
+  # Not reachable from the host or the internet:
+  data: { internal: true }
+  messaging: { internal: true }
+  observability: {}
+
+volumes:
+  postgres-data:
+  redis-queue-data:
+  objectstore-data:
+  kafka-data:
+  rabbitmq-data:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,52 @@
+# docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile messaging up
+# Dev: watch-mode build, source bind-mounted, ports published on localhost only.
+
+x-dev-app: &dev-app
+  build: { context: ., target: dev }
+  image: logistics-platform:dev
+  read_only: false
+  volumes: ['./src:/app/src']
+  environment:
+    NODE_ENV: development
+    LOG_PRETTY: 'true'
+
+services:
+  nginx:
+    ports: ['127.0.0.1:8080:8080']
+
+  api:
+    <<: *dev-app
+    command: ['sh', '-c', 'npx tsc -p tsconfig.build.json --watch --preserveWatchOutput & exec node --watch dist/entrypoints/api.js']
+    environment: { NODE_ENV: development, LOG_PRETTY: 'true', PORT: '3000', HEALTH_PORT: '3000' }
+    ports: ['127.0.0.1:3000:3000']
+
+  worker:
+    <<: *dev-app
+    command: ['sh', '-c', 'npx tsc -p tsconfig.build.json --watch --preserveWatchOutput & exec node --watch dist/entrypoints/worker.js']
+    environment: { NODE_ENV: development, LOG_PRETTY: 'true', OPS_PORT: '9100', HEALTH_PORT: '9100' }
+
+  relay:
+    <<: *dev-app
+    command: ['sh', '-c', 'npx tsc -p tsconfig.build.json --watch --preserveWatchOutput & exec node --watch dist/entrypoints/relay.js']
+    environment: { NODE_ENV: development, LOG_PRETTY: 'true', OPS_PORT: '9100', HEALTH_PORT: '9100' }
+
+  postgres:
+    ports: ['127.0.0.1:5432:5432']
+  redis-cache:
+    ports: ['127.0.0.1:6379:6379']
+  redis-queue:
+    ports: ['127.0.0.1:6380:6379']
+  objectstore:
+    ports: ['127.0.0.1:9000:9000', '127.0.0.1:9001:9001']
+  mailpit:
+    ports: ['127.0.0.1:8025:8025', '127.0.0.1:1025:1025']
+  kafka-ui:
+    ports: ['127.0.0.1:8081:8080']
+  rabbitmq:
+    ports: ['127.0.0.1:5672:5672', '127.0.0.1:15672:15672']
+  prometheus:
+    ports: ['127.0.0.1:9090:9090']
+  grafana:
+    ports: ['127.0.0.1:3001:3000']
+  jaeger:
+    ports: ['127.0.0.1:16686:16686']
